@@ -1,23 +1,4 @@
 #!/usr/bin/env bash
-# Blocking variant of the cloud_repo setup entry point (2026-09-27).
-#
-# The checked-in setup.sh publishes a detached supervisor and returns 0
-# immediately.  That releases the repository in ~2 minutes, but it also lets
-# the turn advance into the agent phase, which bills the account quota for
-# the submitted message: measured 3.4% of a free-plan quota per accepted
-# session, so an account burned 100% in ~58 minutes and left the fleet.
-#
-# This variant execs the same supervisor in the foreground instead.  The
-# setup phase then stays open until the platform kills it at its 1200s
-# setup timeout -- measured terminal state `startup_script_timed_out` -- and
-# the agent phase never starts: measured zero quota movement across a full
-# 20-minute session (24% -> 24%), with the miner registering normally.
-#
-# Trade-off (measured): a blocking setup holds its repository slot for the
-# whole 20 minutes instead of ~2, so the same submission rate needs ~10x the
-# concurrent-setup headroom, and the pool plus the per-account inflight cap
-# become the binding constraints rather than the quota.
-#
 # shellcheck disable=SC2317
 # Trap callbacks are referenced indirectly, so ShellCheck cannot see the calls.
 set -euo pipefail
@@ -611,7 +592,66 @@ finally:
     cleanup()
 PY
 
-# Blocking variant: the supervisor IS the setup process.  Container death is
-# a platform SIGKILL, so no cleanup trap runs and the mktemp tree is left to
-# the host reaper -- exactly like a hard kill of the detached variant.
-exec python3 -u -c "$SUPERVISOR_SOURCE"     "$BRIDGE_URL" "$ADAPTER_FILE" "$ADAPTER_READY"     "$RUNTIME_CONFIG" "$SUPERVISOR_READY" "$RUNTIME_LOG"     "$CONTROL_FILE" "$TMPROOT"
+SUPERVISOR_PID=$(spawn_detached \
+    python3 -u -c "$SUPERVISOR_SOURCE" \
+    "$BRIDGE_URL" "$ADAPTER_FILE" "$ADAPTER_READY" \
+    "$RUNTIME_CONFIG" "$SUPERVISOR_READY" "$RUNTIME_LOG" \
+    "$CONTROL_FILE" "$TMPROOT")
+if [[ ! "$SUPERVISOR_PID" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' 'runtime supervisor returned an invalid pid' >&2
+    exit 69  # 69: runtime supervisor spawn returned an invalid pid
+fi
+
+for _ in {1..120}; do
+    [[ -s "$SUPERVISOR_READY" ]] && break
+    if ! pid_is_running "$SUPERVISOR_PID"; then
+        printf '%s\n' 'runtime supervisor exited during startup' >&2
+        [[ ! -s "$RUNTIME_LOG" ]] || tail -n 20 "$RUNTIME_LOG" >&2
+        exit 70  # 70: runtime supervisor exited during startup
+    fi
+    sleep 0.1
+done
+
+if [[ ! -s "$SUPERVISOR_READY" ]]; then
+    printf '%s\n' 'runtime supervisor readiness timeout' >&2
+    [[ ! -s "$RUNTIME_LOG" ]] || tail -n 20 "$RUNTIME_LOG" >&2
+    exit 71  # 71: runtime supervisor readiness timeout
+fi
+if ! python3 - "$SUPERVISOR_READY" "$SUPERVISOR_PID" <<'PY'
+import json
+import pathlib
+import sys
+
+
+def is_running(pid):
+    try:
+        fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    except (FileNotFoundError, PermissionError, IndexError):
+        return False
+    return fields[0] not in {"Z", "X"}
+
+
+with open(sys.argv[1], encoding="ascii") as handle:
+    value = json.load(handle)
+expected = int(sys.argv[2])
+pids = [value.get(name) for name in ("supervisor_pid", "adapter_pid", "cloud_pid")]
+if any(not isinstance(pid, int) or pid <= 1 for pid in pids):
+    sys.exit(72)  # 72: runtime processes stopped during setup handoff
+if pids[0] != expected or not all(is_running(pid) for pid in pids):
+    sys.exit(72)  # 72: runtime processes stopped during setup handoff
+PY
+then
+    printf '%s\n' 'runtime processes stopped during setup handoff' >&2
+    [[ ! -s "$RUNTIME_LOG" ]] || tail -n 20 "$RUNTIME_LOG" >&2
+    exit 72  # 72: runtime processes stopped during setup handoff
+fi
+
+# Publish only non-secret diagnostics for the follow-up turn. The controlled
+# identity never appears in either line.
+printf 'setup_ready=1\nruntime_log=%s\n' "$RUNTIME_LOG"
+
+# The detached supervisor owns the bounded log sink; both child sessions retain
+# only their private log pipe and runtime descriptors. The setup runner can
+# return now.
+trap - EXIT INT TERM HUP
+exit 0
