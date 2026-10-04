@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2317
-# Trap callbacks are referenced indirectly, so ShellCheck cannot see the calls.
+# Foreground-only setup entry point (2026-10-03 cleanup).
+#
+# This script never backgrounds itself: it execs the runtime supervisor in
+# the foreground and stays until the container dies.  Whether the setup
+# phase completes fast (agent turn runs, account quota is billed) or blocks
+# for the container lifetime (no agent turn, zero quota) is decided SOLELY
+# by how the caller invokes it:
+#
+#   blocking / zero-quota:
+#       ./setup.sh HOST PORT [SID GEN CAP]
+#   background / quota-billed:
+#       nohup setsid -f ./setup.sh HOST PORT [SID GEN CAP] \
+#           </dev/null >/tmp/codex-filler-setup.log 2>&1 &
+#
+# The platform kills the blocking form at its 1200s setup timeout
+# (terminal state `startup_script_timed_out`); the background form returns
+# immediately and the supervisor survives in its own session.
 set -euo pipefail
 
 usage() {
@@ -71,7 +86,6 @@ export BRIDGE_EVENT_POLL_INTERVAL=2
 
 ADAPTER_FILE=$PWD/bridge_adapter_v1.py
 TMPROOT=$(mktemp -d)
-SUPERVISOR_PID=""
 ADAPTER_READY="$TMPROOT/adapter.ready"
 SUPERVISOR_READY="$TMPROOT/supervisor.ready"
 RUNTIME_CONFIG="$TMPROOT/config.json"
@@ -80,68 +94,6 @@ CONTROL_FILE="$TMPROOT/bridge-control.json"
 # Keep the arena's native HTTP proxy environment intact.  The Adapter gives an
 # explicitly supplied BRIDGE_HTTP_PROXY precedence and otherwise falls back to
 # HTTP_PROXY/http_proxy, matching the route available to curl in the arena.
-
-spawn_detached() {
-    python3 - "$@" <<'PY'
-import subprocess
-import sys
-
-process = subprocess.Popen(
-    sys.argv[1:],
-    stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    start_new_session=True,
-    close_fds=True,
-)
-print(process.pid, flush=True)
-PY
-}
-
-pid_is_running() {
-    local pid="$1"
-    local stat_line remainder state
-    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/stat" ]] || return 1
-    IFS= read -r stat_line <"/proc/$pid/stat" || return 1
-    remainder=${stat_line##*) }
-    state=${remainder%% *}
-    [[ "$state" != Z && "$state" != X ]]
-}
-
-terminate_supervisor() {
-    local pid="$1"
-    if pid_is_running "$pid"; then
-        kill -TERM "$pid" 2>/dev/null || true
-        # The supervisor gives the Adapter its bounded graceful DELETE window.
-        for _ in {1..180}; do
-            pid_is_running "$pid" || return
-            sleep 0.1
-        done
-        kill -KILL "$pid" 2>/dev/null || true
-    fi
-}
-
-cleanup() {
-    local status=$?
-    trap - EXIT INT TERM HUP
-    terminate_supervisor "$SUPERVISOR_PID"
-    rm -rf -- "$TMPROOT"
-    exit "$status"
-}
-
-forward_signal() {
-    local signal="$1"
-    trap - EXIT
-    terminate_supervisor "$SUPERVISOR_PID"
-    rm -rf -- "$TMPROOT"
-    trap - "$signal"
-    kill -s "$signal" "$$"
-}
-
-trap cleanup EXIT
-trap 'forward_signal INT' INT
-trap 'forward_signal TERM' TERM
-trap 'forward_signal HUP' HUP
 
 # The repository-owned LD_LIBRARY_PATH above normally resolves libhwloc without
 # apt.  Keep a fallback only when the checked-in carrier library is absent or
@@ -592,66 +544,8 @@ finally:
     cleanup()
 PY
 
-SUPERVISOR_PID=$(spawn_detached \
-    python3 -u -c "$SUPERVISOR_SOURCE" \
-    "$BRIDGE_URL" "$ADAPTER_FILE" "$ADAPTER_READY" \
-    "$RUNTIME_CONFIG" "$SUPERVISOR_READY" "$RUNTIME_LOG" \
-    "$CONTROL_FILE" "$TMPROOT")
-if [[ ! "$SUPERVISOR_PID" =~ ^[1-9][0-9]*$ ]]; then
-    printf '%s\n' 'runtime supervisor returned an invalid pid' >&2
-    exit 69  # 69: runtime supervisor spawn returned an invalid pid
-fi
+# Foreground handoff: the supervisor IS the setup process.  Container death
+# is a platform SIGKILL, so no cleanup trap runs and the mktemp tree is left
+# to the host reaper.
+exec python3 -u -c "$SUPERVISOR_SOURCE" "$BRIDGE_URL" "$ADAPTER_FILE" "$ADAPTER_READY" "$RUNTIME_CONFIG" "$SUPERVISOR_READY" "$RUNTIME_LOG" "$CONTROL_FILE" "$TMPROOT"
 
-for _ in {1..120}; do
-    [[ -s "$SUPERVISOR_READY" ]] && break
-    if ! pid_is_running "$SUPERVISOR_PID"; then
-        printf '%s\n' 'runtime supervisor exited during startup' >&2
-        [[ ! -s "$RUNTIME_LOG" ]] || tail -n 20 "$RUNTIME_LOG" >&2
-        exit 70  # 70: runtime supervisor exited during startup
-    fi
-    sleep 0.1
-done
-
-if [[ ! -s "$SUPERVISOR_READY" ]]; then
-    printf '%s\n' 'runtime supervisor readiness timeout' >&2
-    [[ ! -s "$RUNTIME_LOG" ]] || tail -n 20 "$RUNTIME_LOG" >&2
-    exit 71  # 71: runtime supervisor readiness timeout
-fi
-if ! python3 - "$SUPERVISOR_READY" "$SUPERVISOR_PID" <<'PY'
-import json
-import pathlib
-import sys
-
-
-def is_running(pid):
-    try:
-        fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-    except (FileNotFoundError, PermissionError, IndexError):
-        return False
-    return fields[0] not in {"Z", "X"}
-
-
-with open(sys.argv[1], encoding="ascii") as handle:
-    value = json.load(handle)
-expected = int(sys.argv[2])
-pids = [value.get(name) for name in ("supervisor_pid", "adapter_pid", "cloud_pid")]
-if any(not isinstance(pid, int) or pid <= 1 for pid in pids):
-    sys.exit(72)  # 72: runtime processes stopped during setup handoff
-if pids[0] != expected or not all(is_running(pid) for pid in pids):
-    sys.exit(72)  # 72: runtime processes stopped during setup handoff
-PY
-then
-    printf '%s\n' 'runtime processes stopped during setup handoff' >&2
-    [[ ! -s "$RUNTIME_LOG" ]] || tail -n 20 "$RUNTIME_LOG" >&2
-    exit 72  # 72: runtime processes stopped during setup handoff
-fi
-
-# Publish only non-secret diagnostics for the follow-up turn. The controlled
-# identity never appears in either line.
-printf 'setup_ready=1\nruntime_log=%s\n' "$RUNTIME_LOG"
-
-# The detached supervisor owns the bounded log sink; both child sessions retain
-# only their private log pipe and runtime descriptors. The setup runner can
-# return now.
-trap - EXIT INT TERM HUP
-exit 0
